@@ -1,6 +1,6 @@
 /**
- * #8459 — Responses->Chat translation of tool-call outputs containing input_image
- * must strip the image and replace with a placeholder, not embed raw base64 as text.
+ * #14111 — Responses->Chat translation of tool-call outputs containing input_image
+ * must keep the tool result textual and lift images into a following user message.
  *
  * Without this fix:
  * - `function_call_output` and `custom_tool_call_output` with an array output
@@ -15,10 +15,24 @@ import assert from "node:assert/strict";
 const { openaiResponsesToOpenAIRequest } =
   await import("../../open-sse/translator/request/openai-responses.ts");
 
-const IMAGE_PLACEHOLDER = "[Image omitted: not supported on Chat Completions tool results]";
+const IMAGE_PLACEHOLDER = "[Image attached in following user message]";
 const SAMPLE_BASE64 = "AAAA" + "a".repeat(100); // small but realistic-looking base64
 
-test("#8459 function_call_output strips input_image and preserves input_text", () => {
+function findImageMessage(messages: Record<string, unknown>[]) {
+  return messages.find(
+    (message) =>
+      message.role === "user" &&
+      Array.isArray(message.content) &&
+      message.content.some(
+        (part) =>
+          typeof part === "object" &&
+          part !== null &&
+          (part as Record<string, unknown>).type === "image_url"
+      )
+  );
+}
+
+test("#14111 function_call_output lifts input_image and preserves input_text", () => {
   const result = openaiResponsesToOpenAIRequest(
     "gpt-5.2",
     {
@@ -65,11 +79,25 @@ test("#8459 function_call_output strips input_image and preserves input_text", (
   );
   assert.ok(
     (toolMsg.content as string).includes(IMAGE_PLACEHOLDER),
-    "image parts must be replaced with placeholder"
+    "tool content must point to the following image message"
   );
+
+  const imageMsg = findImageMessage(messages);
+  assert.ok(imageMsg, "should lift the image into a user message");
+  const imageContent = imageMsg.content as Record<string, unknown>[];
+  assert.deepEqual(imageContent, [
+    { type: "text", text: "Image output from tool call call_abc123:" },
+    {
+      type: "image_url",
+      image_url: {
+        url: `data:image/png;base64,${SAMPLE_BASE64}`,
+        detail: "original",
+      },
+    },
+  ]);
 });
 
-test("#8459 custom_tool_call_output strips input_image and preserves input_text", () => {
+test("#14111 custom_tool_call_output lifts input_image and preserves input_text", () => {
   const result = openaiResponsesToOpenAIRequest(
     "gpt-5.2",
     {
@@ -113,7 +141,62 @@ test("#8459 custom_tool_call_output strips input_image and preserves input_text"
   );
   assert.ok(
     (toolMsg.content as string).includes(IMAGE_PLACEHOLDER),
-    "image parts must be replaced with placeholder"
+    "tool content must point to the following image message"
+  );
+
+  const imageMsg = findImageMessage(messages);
+  assert.ok(imageMsg, "should lift the image into a user message");
+  const imageContent = imageMsg.content as Record<string, unknown>[];
+  assert.deepEqual(imageContent, [
+    { type: "text", text: "Image output from tool call call_def456:" },
+    {
+      type: "image_url",
+      image_url: {
+        url: `data:image/png;base64,${SAMPLE_BASE64}`,
+        detail: "original",
+      },
+    },
+  ]);
+});
+
+test("#14111 parallel tool images stay after every tool result", () => {
+  const result = openaiResponsesToOpenAIRequest(
+    "gpt-5.2",
+    {
+      input: [
+        {
+          type: "function_call",
+          call_id: "call_one",
+          name: "capture_one",
+          arguments: "{}",
+        },
+        {
+          type: "function_call",
+          call_id: "call_two",
+          name: "capture_two",
+          arguments: "{}",
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_one",
+          output: [{ type: "input_image", image_url: "data:image/png;base64,ONE" }],
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_two",
+          output: [{ type: "input_image", image_url: "data:image/png;base64,TWO" }],
+        },
+      ],
+    },
+    false,
+    {}
+  );
+
+  const messages = (result as Record<string, unknown>).messages as Record<string, unknown>[];
+  assert.deepEqual(
+    messages.map((message) => message.role),
+    ["assistant", "tool", "tool", "user", "user"],
+    "all tool results must remain contiguous before lifted image messages"
   );
 });
 

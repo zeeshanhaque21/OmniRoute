@@ -37,19 +37,22 @@ import {
 export { openaiToOpenAIResponsesRequest } from "./openai-responses/toResponses.ts";
 
 /**
- * #8459: Convert a tool output content-part array to a safe string for Chat Completions
- * tool content. Responses API tool outputs can contain `input_image` parts which have no
- * equivalent in Chat Completions `tool` messages — JSON.stringify would embed the raw
- * base64 as inert text. Instead, extract text parts and replace images with a placeholder.
+ * #8459, #14111: Split a Responses tool output into Chat-safe tool text and image parts.
+ * Chat Completions `tool` messages cannot contain images, so keep their text content on
+ * the tool message and lift images into a following multimodal user message.
  *
  * @param output - The tool output value (string, array of content parts, or other JSON)
- * @returns A plain string safe for Chat Completions `tool` message content.
+ * @returns Chat-safe tool text plus structured image parts for a following user message.
  */
-function toolOutputContentToString(output: unknown): string {
-  if (typeof output === "string") return output;
-  if (!Array.isArray(output)) return JSON.stringify(output);
+function translateToolOutputContent(output: unknown): {
+  content: string;
+  images: JsonRecord[];
+} {
+  if (typeof output === "string") return { content: output, images: [] };
+  if (!Array.isArray(output)) return { content: JSON.stringify(output), images: [] };
 
   const parts: string[] = [];
+  const images: JsonRecord[] = [];
   for (const item of output) {
     if (typeof item !== "object" || item === null) {
       parts.push(String(item));
@@ -61,7 +64,13 @@ function toolOutputContentToString(output: unknown): string {
       const text = typeof rec.text === "string" ? rec.text : "";
       if (text) parts.push(text);
     } else if (type === "input_image") {
-      parts.push("[Image omitted: not supported on Chat Completions tool results]");
+      const url = toString(rec.image_url);
+      if (url) {
+        const imageUrl: JsonRecord = { url };
+        if (rec.detail !== undefined) imageUrl.detail = rec.detail;
+        images.push({ type: "image_url", image_url: imageUrl });
+        parts.push("[Image attached in following user message]");
+      }
     } else {
       // Unknown part type — stringify as fallback
       try {
@@ -71,7 +80,7 @@ function toolOutputContentToString(output: unknown): string {
       }
     }
   }
-  return parts.join("\n");
+  return { content: parts.join("\n"), images };
 }
 
 function appendReasoningContent(current: unknown, next: string): string {
@@ -210,7 +219,22 @@ export function openaiResponsesToOpenAIRequest(
   // Group items by conversation turn
   let currentAssistantMsg: JsonRecord | null = null;
   let pendingToolResults: JsonRecord[] = [];
+  let pendingToolImageMessages: JsonRecord[] = [];
   let pendingReasoningContent = "";
+
+  const flushPendingToolImageMessages = () => {
+    if (pendingToolImageMessages.length === 0) return;
+    messages.push(...pendingToolImageMessages);
+    pendingToolImageMessages = [];
+  };
+
+  const queueToolImages = (callId: string, images: JsonRecord[]) => {
+    if (images.length === 0) return;
+    pendingToolImageMessages.push({
+      role: "user",
+      content: [{ type: "text", text: `Image output from tool call ${callId}:` }, ...images],
+    });
+  };
 
   // Upstream providers reject messages:[] with "400: at least one message is required".
   // When the client sends input:[] (empty), inject a placeholder user message — mirrors
@@ -225,6 +249,10 @@ export function openaiResponsesToOpenAIRequest(
     // Determine item type - Droid CLI sends role-based items without 'type' field
     // Fallback: if no type but has role property, treat as message
     const itemType = toString(item.type) || (item.role ? "message" : "");
+
+    if (itemType !== "function_call_output" && itemType !== "custom_tool_call_output") {
+      flushPendingToolImageMessages();
+    }
 
     if (itemType === "message") {
       const role = toString(item.role);
@@ -373,12 +401,15 @@ export function openaiResponsesToOpenAIRequest(
         pendingToolResults = [];
       }
 
-      // Add tool result immediately
+      const translatedOutput = translateToolOutputContent(item.output);
+
+      // Add tool result immediately. Images follow after the complete run of tool results.
       messages.push({
         role: "tool",
         tool_call_id: toString(item.call_id),
-        content: toolOutputContentToString(item.output),
+        content: translatedOutput.content,
       });
+      queueToolImages(toString(item.call_id), translatedOutput.images);
       continue;
     }
 
@@ -432,7 +463,8 @@ export function openaiResponsesToOpenAIRequest(
       // Unwrap JSON-wrapped output {"output":"...","metadata":{...}} → plain string.
       // #8459: handle content-part arrays that may contain input_image without
       // stringifying raw base64 as text.
-      const rawOut = toolOutputContentToString(item.output);
+      const translatedOutput = translateToolOutputContent(item.output);
+      const rawOut = translatedOutput.content;
       let toolContent = rawOut;
       try {
         const parsed = JSON.parse(rawOut);
@@ -445,6 +477,7 @@ export function openaiResponsesToOpenAIRequest(
         tool_call_id: toString(item.call_id),
         content: toolContent,
       });
+      queueToolImages(toString(item.call_id), translatedOutput.images);
       continue;
     }
 
@@ -505,6 +538,7 @@ export function openaiResponsesToOpenAIRequest(
       messages.push(toolResult);
     }
   }
+  flushPendingToolImageMessages();
 
   // Convert tools format
   if (tools.length > 0) {
